@@ -16,6 +16,8 @@
 #include "c.h"
 #include "libpq-fe.h"
 
+#include "nodes/pg_list.h"
+#include "utils/hsearch.h"
 
 /* maximum duration to wait for connection */
 #define CLIENT_CONNECT_TIMEOUT_SECONDS "5"
@@ -51,12 +53,18 @@ typedef struct NodeConnectionEntry
 } NodeConnectionEntry;
 
 
+/* ShardConnections represents a set of connections for each placement of a shard */
+typedef struct ShardConnections
+{
+	int64 shardId;
+	List *connectionList;
+} ShardConnections;
+
+
 /* function declarations for obtaining and using a connection */
 extern PGconn * GetOrEstablishConnection(char *nodeName, int32 nodePort);
 extern void PurgeConnection(PGconn *connection);
 extern void ReportRemoteError(PGconn *connection, PGresult *result);
 extern PGconn * ConnectToNode(char *nodeName, int nodePort, char *nodeUser);
 extern char * ConnectionGetOptionValue(PGconn *connection, char *optionKeyword);
-
-
 #endif /* CONNECTION_CACHE_H */

@@ -16,6 +16,7 @@
 
 #include "postgres.h"
 #include "funcapi.h"
+#include "libpq-fe.h"
 #include "miscadmin.h"
 
 #include "access/xact.h"
@@ -23,14 +24,19 @@
 #include "catalog/pg_class.h"
 #include "commands/dbcommands.h"
 #include "commands/event_trigger.h"
+#include "distributed/citus_ruleutils.h"
+#include "distributed/connection_cache.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_client_executor.h"
 #include "distributed/multi_physical_planner.h"
+#include "distributed/multi_router_planner.h"
 #include "distributed/multi_server_executor.h"
+#include "distributed/multi_transaction.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/pg_dist_partition.h"
+#include "distributed/resource_lock.h"
 #include "distributed/worker_protocol.h"
 #include "optimizer/clauses.h"
 #include "optimizer/predtest.h"
@@ -43,10 +49,9 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 
-
 /* Local functions forward declarations */
 static void CheckTableCount(Query *deleteQuery);
-static void CheckDeleteCriteria(Node *deleteCriteria);
+static void CheckDeleteCriteria(Node *queryTreeNode);
 static void CheckPartitionColumn(Oid relationId, Node *whereClause);
 static List * ShardsMatchingDeleteCriteria(Oid relationId, List *shardList,
 										   Node *deleteCriteria);
@@ -163,7 +168,7 @@ master_apply_delete_command(PG_FUNCTION_ARGS)
 
 
 /*
- * master_drop_shards attempts to drop all shards for a given relation.
+ * master_drop_all_shards attempts to drop all shards for a given relation.
  * Unlike master_apply_delete_command, this function can be called even
  * if the table has already been dropped.
  */

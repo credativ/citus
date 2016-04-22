@@ -57,6 +57,9 @@ extern void PrepareRemoteTransactions(List *connectionList);
 extern void AbortRemoteTransactions(List *connectionList);
 extern void CommitRemoteTransactions(List *connectionList, bool stopOnFailure);
 extern void CloseConnections(List *connectionList);
-
-
+extern HTAB * CreateShardConnectionHash(void);
+extern ShardConnections * GetShardConnections(HTAB *shardConnectionHash,
+											  int64 shardId,
+											  bool *shardConnectionsFound);
+extern List * ConnectionList(HTAB *connectionHash);
 #endif /* MULTI_TRANSACTION_H */

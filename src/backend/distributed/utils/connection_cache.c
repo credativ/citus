@@ -23,12 +23,16 @@
 #include "distributed/metadata_cache.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
+#include "nodes/pg_list.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/errcodes.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
+
+
+#define INITIAL_CONNECTION_CACHE_SIZE 1001
 
 
 /*
