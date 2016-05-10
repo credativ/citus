@@ -57,6 +57,7 @@ double CountDistinctErrorRate = 0.0; /* precision of count(distinct) approximate
 /* XXX Bad coding practice */
 #define BASE_SORT_GROUP_REF 100
 static bool IsSubquery = false;
+static int CurrentSortGroupRef = BASE_SORT_GROUP_REF;
 
 /* Local functions forward declarations */
 static MultiSelect * AndSelectNode(MultiSelect *selectNode);
@@ -1130,7 +1131,9 @@ ApplyExtendedOpNodes(MultiExtendedOp *originalNode, MultiExtendedOp *masterNode,
 	pfree(originalNode);
 }
 
-
+/*
+ * CountDistinctAggregateWalker
+ */
 static bool
 CountDistinctAggregateWalker(Node *node, List **distinctGroupByList)
 {
@@ -1152,10 +1155,8 @@ CountDistinctAggregateWalker(Node *node, List **distinctGroupByList)
 			List *columnList = pull_var_clause_default((Node*) distinctTargetEntry);
 			ListCell *columnCell = NULL;
 			List *addedColumnList = NIL;
-			int32 distinctColumnCount = list_length(*distinctGroupByList);
-			Index distinctColumnSortGroupRefIndex = BASE_SORT_GROUP_REF + distinctColumnCount;
 
-			distinctTargetEntry->ressortgroupref = distinctColumnSortGroupRefIndex;
+			distinctTargetEntry->ressortgroupref = CurrentSortGroupRef;
 
 			foreach(columnCell, columnList)
 			{
@@ -1181,10 +1182,10 @@ CountDistinctAggregateWalker(Node *node, List **distinctGroupByList)
 				newDistinctGroupBy->hashable = hashable;
 				newDistinctGroupBy->nulls_first = false;
 				newDistinctGroupBy->sortop = opLt;
-				newDistinctGroupBy->tleSortGroupRef = distinctColumnSortGroupRefIndex;
+				newDistinctGroupBy->tleSortGroupRef = CurrentSortGroupRef;
 
 				(*distinctGroupByList) = lappend(*distinctGroupByList, newDistinctGroupBy);
-				distinctColumnSortGroupRefIndex++;
+				CurrentSortGroupRef++;
 			}
 
 			walkerResult = expression_tree_walker(node, CountDistinctAggregateWalker,
@@ -1205,7 +1206,6 @@ CountDistinctAggregateWalker(Node *node, List **distinctGroupByList)
 	return walkerResult;
 }
 
-
 /*
  * TransformSubqueryNode splits the extended operator node under subquery
  * multi table node into its equivalent master and worker operator nodes, and
@@ -1223,7 +1223,6 @@ TransformSubqueryNode(MultiTable *subqueryNode)
 	MultiNode *collectChildNode = ChildNode((MultiUnaryNode *) collectNode);
 	MultiExtendedOp *masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode);
 	MultiPartition *partitionNode = CitusMakeNode(MultiPartition);
-
 	MultiExtendedOp *workerExtendedOpNode = NULL;
 	List *groupTargetEntryList = NIL;
 	TargetEntry *groupByTargetEntry = NULL;
@@ -1786,8 +1785,6 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 			TargetEntry *newTargetEntry = copyObject(originalTargetEntry);
 			newTargetEntry->expr = newExpression;
 
-
-
 			if (IsA(newExpression, TargetEntry))
 			{
 				TargetEntry *distinctTargetEntry = (TargetEntry *) newExpression;
@@ -1799,7 +1796,11 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 
 				if (newTargetEntry->resname != NULL)
 				{
-					appendStringInfo(aggregateColumnName, "%s_%d", newTargetEntry->resname, targetIndex);
+					appendStringInfo(aggregateColumnName, "%s", newTargetEntry->resname);
+					if (targetIndex > 0)
+					{
+						appendStringInfo(aggregateColumnName, "_%d", targetIndex);
+					}
 					newTargetEntry->resname = aggregateColumnName->data;
 				}
 			}
@@ -1817,9 +1818,8 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 			newTargetEntry->resjunk = false;
 			newTargetEntry->resno = targetProjectionNumber;
 			targetProjectionNumber++;
-
-			newTargetEntryList = lappend(newTargetEntryList, newTargetEntry);
 			targetIndex++;
+			newTargetEntryList = lappend(newTargetEntryList, newTargetEntry);
 		}
 	}
 
@@ -2371,6 +2371,16 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 		}
 	}
 
+	if (aggregateType == AGGREGATE_COUNT)
+	{
+		List *aggregateVarList = pull_var_clause_default((Node *) aggregateExpression);
+		if (aggregateVarList == NIL)
+		{
+			distinctSupported = false;
+			errorDetail = "aggregate (distinct) with no columns is unsupported";
+		}
+	}
+
 	repartitionNodeList = FindNodesOfType(logicalPlanNode, T_MultiPartition);
 	if (repartitionNodeList != NIL)
 	{
@@ -2383,7 +2393,7 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 	extendedOpNode = (MultiExtendedOp *) linitial(opNodeList);
 
 	distinctColumn = AggregateDistinctColumn(aggregateExpression);
-	if (distinctColumn == NULL)
+	if (distinctSupported && distinctColumn == NULL)
 	{
 		/*
 		 * If the query has a single table, and table is grouped by partition column,
@@ -2397,7 +2407,7 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 			errorDetail = "aggregate (distinct) on complex expressions is unsupported";
 		}
 	}
-	else
+	else if (distinctSupported)
 	{
 		bool supports = TablePartitioningSupportsDistinct(tableNodeList, extendedOpNode,
 														  distinctColumn);
@@ -2489,6 +2499,7 @@ TablePartitioningSupportsDistinct(List *tableNodeList, MultiExtendedOp *opNode,
 		if (relationId == SUBQUERY_RELATION_ID)
 		{
 			IsSubquery = true;
+			CurrentSortGroupRef = BASE_SORT_GROUP_REF;
 			return true;
 		}
 

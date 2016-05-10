@@ -1,0 +1,187 @@
+--
+-- COMPLEX_COUNT_DISTINCT
+--
+CREATE TABLE lineitem_hash (
+	l_orderkey bigint not null,
+	l_partkey integer not null,
+	l_suppkey integer not null,
+	l_linenumber integer not null,
+	l_quantity decimal(15, 2) not null,
+	l_extendedprice decimal(15, 2) not null,
+	l_discount decimal(15, 2) not null,
+	l_tax decimal(15, 2) not null,
+	l_returnflag char(1) not null,
+	l_linestatus char(1) not null,
+	l_shipdate date not null,
+	l_commitdate date not null,
+	l_receiptdate date not null,
+	l_shipinstruct char(25) not null,
+	l_shipmode char(10) not null,
+	l_comment varchar(44) not null,
+	PRIMARY KEY(l_orderkey, l_linenumber) );
+	
+SELECT master_create_distributed_table('lineitem_hash', 'l_orderkey', 'hash');
+ master_create_distributed_table 
+---------------------------------
+ 
+(1 row)
+
+SELECT master_create_worker_shards('lineitem_hash', 8, 1);
+ master_create_worker_shards 
+-----------------------------
+ 
+(1 row)
+
+\COPY lineitem_hash FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
+\COPY lineitem_hash FROM '@abs_srcdir@/data/lineitem.2.data' with delimiter '|'
+SET citus.task_executor_type to "task-tracker";
+-- count(distinct) is supported on top level query if there
+-- is a grouping on the partition key	
+SELECT 
+	l_orderkey, count(DISTINCT l_partkey) 
+	FROM lineitem_hash 
+	GROUP BY l_orderkey 
+	ORDER BY 2 DESC 
+	LIMIT 10;
+ l_orderkey | count 
+------------+-------
+       1283 |     7
+      10982 |     7
+       5511 |     7
+      10916 |     7
+       1060 |     7
+      13733 |     7
+      12737 |     7
+       9280 |     7
+       9344 |     7
+       1543 |     7
+(10 rows)
+
+-- it is not supported if there is no grouping or grouping is on non-partition field
+SELECT 
+	count(DISTINCT l_partkey) 
+	FROM lineitem_hash 
+	ORDER BY 1 DESC 
+	LIMIT 10;
+ERROR:  cannot compute aggregate (distinct)
+DETAIL:  table partitioning is unsuitable for aggregate (distinct)
+HINT:  You can load the hll extension from contrib packages and enable distinct approximations.
+SELECT 
+	l_shipmode, count(DISTINCT l_partkey) 
+	FROM lineitem_hash 
+	GROUP BY l_shipmode 
+	ORDER BY 2 DESC 
+	LIMIT 10;
+ERROR:  cannot compute aggregate (distinct)
+DETAIL:  table partitioning is unsuitable for aggregate (distinct)
+HINT:  You can load the hll extension from contrib packages and enable distinct approximations.
+-- count distinct is supported on single table subqueries
+SELECT *
+	FROM (
+		SELECT 
+			l_orderkey, count(DISTINCT l_partkey) 
+			FROM lineitem_hash 
+			GROUP BY l_orderkey) sub
+	ORDER BY 2 DESC 
+	LIMIT 10;
+ l_orderkey | count 
+------------+-------
+        899 |     7
+        194 |     7
+         68 |     7
+        807 |     7
+        896 |     7
+        129 |     7
+        164 |     7
+        967 |     7
+        930 |     7
+        801 |     7
+(10 rows)
+
+-- case expr in count distinct is supported.
+-- count orders partkeys if l_shipmode is air
+SELECT *
+	FROM (
+		SELECT 
+			l_orderkey, count(DISTINCT CASE WHEN l_shipmode = 'AIR' THEN l_partkey ELSE NULL END) as count 
+			FROM lineitem_hash 
+			GROUP BY l_orderkey) sub
+	WHERE count > 0
+	ORDER BY 2 DESC, 1 DESC 
+	LIMIT 10;
+ l_orderkey | count 
+------------+-------
+      12005 |     4
+       5409 |     4
+       4964 |     4
+      14848 |     3
+      14496 |     3
+      13473 |     3
+      13122 |     3
+      12929 |     3
+      12645 |     3
+      12417 |     3
+(10 rows)
+
+-- text like operator is also supported
+SELECT *
+	FROM (
+		SELECT 
+			l_orderkey, count(DISTINCT CASE WHEN l_shipmode like '%A%' THEN l_partkey ELSE NULL END) as count 
+			FROM lineitem_hash 
+			GROUP BY l_orderkey) sub
+	WHERE count > 0
+	ORDER BY 2 DESC, 1 DESC 
+	LIMIT 10;
+ l_orderkey | count 
+------------+-------
+      14275 |     7
+      14181 |     7
+      13605 |     7
+      12707 |     7
+      12384 |     7
+      11746 |     7
+      10727 |     7
+      10467 |     7
+       5636 |     7
+       4614 |     7
+(10 rows)
+
+-- count distinct is rejected if it does not reference any columns
+SELECT *
+	FROM (
+		SELECT 
+			l_orderkey, count(DISTINCT 1) 
+			FROM lineitem_hash 
+			GROUP BY l_orderkey) sub
+	ORDER BY 2 DESC 
+	LIMIT 10;
+ERROR:  cannot compute aggregate (distinct)
+DETAIL:  aggregate (distinct) with no columns is unsupported
+HINT:  You can load the hll extension from contrib packages and enable distinct approximations.
+-- count distinct is rejected if it does not reference any columns
+SELECT *
+	FROM (
+		SELECT 
+			l_orderkey, count(DISTINCT (random() * 5)::int) 
+			FROM lineitem_hash 
+			GROUP BY l_orderkey) sub
+	ORDER BY 2 DESC 
+	LIMIT 10;
+ERROR:  cannot compute aggregate (distinct)
+DETAIL:  aggregate (distinct) with no columns is unsupported
+HINT:  You can load the hll extension from contrib packages and enable distinct approximations.
+-- even non-const function calls are supported within count distinct
+SELECT *
+	FROM (
+		SELECT 
+			l_orderkey, count(DISTINCT (random() * 5)::int = l_linenumber) 
+			FROM lineitem_hash 
+			GROUP BY l_orderkey) sub
+	ORDER BY 2 DESC 
+	LIMIT 0;
+ l_orderkey | count 
+------------+-------
+(0 rows)
+
+DROP TABLE lineitem_hash;
