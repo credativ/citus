@@ -2459,7 +2459,6 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 		distinctSupported = TablePartitioningSupportsDistinct(tableNodeList,
 															  extendedOpNode,
 															  distinctColumn);
-
 		if (!distinctSupported)
 		{
 			errorDetail = "aggregate (distinct) on complex expressions is unsupported";
