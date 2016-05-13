@@ -287,6 +287,14 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 				specifiesPartitionValue = true;
 			}
 
+			if (targetEntry->resno == partitionColumn->varattno &&
+				!IsA(targetEntry->expr, Const))
+			{
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("values given for the partition column must be"
+							   " constants or constant expressions")));
+			}
+
 			if (commandType == CMD_UPDATE &&
 				ContainsDisallowedFunctionCalls((Node *) targetEntry->expr))
 			{

@@ -284,8 +284,8 @@ ExecuteDistributedModify(Query *query, Task *task)
 
 	ExecuteFunctions(query);
 	DeparseShardQuery(query, task, queryString);
-	elog(WARNING, "old query: %s", task->queryString);
-	elog(WARNING, "new query: %s", queryString->data);
+	elog(DEBUG4, "old query: %s", task->queryString);
+	elog(DEBUG4, "new query: %s", queryString->data);
 
 	foreach(taskPlacementCell, task->taskPlacementList)
 	{
@@ -681,7 +681,7 @@ void ExecuteFunctions(Query *query)
 		}
 
 		deparsedOrig = deparse_expression(originalCopy, deparseContext, false, true);
-		elog(WARNING, "target: %s", deparsedOrig);
+		elog(DEBUG4, "target: %s", deparsedOrig);
 
 		modifiedNode = PartiallyEvaluateExpression((Node *) targetEntry->expr);
 
@@ -689,7 +689,7 @@ void ExecuteFunctions(Query *query)
 		modifiedCopy = (Node *) copyObject(targetEntry->expr);
 
 		deparsedModified = deparse_expression(modifiedCopy, deparseContext, false, false);
-		elog(WARNING, "after : %s", deparsedModified);
+		elog(DEBUG4, "after : %s", deparsedModified);
 	}
 }
 
