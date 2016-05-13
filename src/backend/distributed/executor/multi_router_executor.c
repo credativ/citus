@@ -34,7 +34,6 @@
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 
-#include "tcop/tcopprot.h"
 #include "utils/ruleutils.h"
 #include "distributed/multi_planner.h"
 #include "distributed/citus_ruleutils.h"

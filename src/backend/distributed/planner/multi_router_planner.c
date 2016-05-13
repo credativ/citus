@@ -51,15 +51,9 @@
 #include "utils/errcodes.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-#include "utils/relcache.h"
-#include "utils/typcache.h"
 
 #include "catalog/pg_proc.h"
 #include "optimizer/planmain.h"
-#include "utils/ruleutils.h"
-#include "optimizer/clauses.h"
-#include "executor/executor.h"
-#include "utils/datum.h"
 
 
 /* planner functions forward declarations */
