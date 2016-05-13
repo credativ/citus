@@ -850,14 +850,6 @@ void DeparseShardQuery(Query *query, Task *task, StringInfo queryString)
 	deparse_shard_query(query, relid, shardId, queryString);
 }
 
-void DeparseQuery(Query* query)
-{
-	Oid relid = ((RangeTblEntry *) linitial(query->rtable))->relid;
-	List *deparseContext = deparse_context_for("table", relid);
-	char *deparsed = deparse_expression((Node *)query, deparseContext, false, true);
-	elog(WARNING, "query: %s", deparsed);
-}
-
 static void InitializeWalkerState(ExpressionWalkerState *state)
 {
 	state->isTopLevel = false;
