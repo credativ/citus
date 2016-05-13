@@ -307,7 +307,7 @@ ExecuteDistributedModify(Query *query, Task *task)
 			continue;
 		}
 
-		result = PQexec(connection, task->queryString);
+		result = PQexec(connection, queryString->data);
 		if (PQresultStatus(result) != PGRES_COMMAND_OK)
 		{
 			ReportRemoteError(connection, result);
