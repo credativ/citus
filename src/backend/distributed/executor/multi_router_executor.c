@@ -34,14 +34,43 @@
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 
+#include "tcop/tcopprot.h"
+#include "utils/ruleutils.h"
+#include "distributed/multi_planner.h"
+#include "distributed/citus_ruleutils.h"
+#include "nodes/nodeFuncs.h"
+#include "utils/lsyscache.h"
+#if (PG_VERSION_NUM >= 90500)
+#include "nodes/makefuncs.h"
+#endif
+
+#include "catalog/pg_proc.h"
+#include "optimizer/planmain.h"
+#include "utils/ruleutils.h"
+#include "optimizer/clauses.h"
+#include "executor/executor.h"
+#include "utils/datum.h"
+
 
 /* controls use of locks to enforce safe commutativity */
 bool AllModificationsCommutative = false;
 
+typedef struct ExpressionWalkerState
+{
+	bool isTopLevel; /* if there are no vars the entire expression can be evaluated */
+	bool containsVar; /* the callee sets this to signal to the parent it has a Var */
+	bool parentIsBranch; /* the caller sets this to signal to the children they should
+							also set the below variables */
+	List *subtreesWithVar; /* when parentIsBranch add yourself to one of these */
+	List *subtreesWithoutVar;
+	List *subtreeWeaving; /* A list of ints representing in which order the broken out
+							 lists should be reassembled */
+} ExpressionWalkerState;
+
 
 static LOCKMODE CommutativityRuleToLockMode(CmdType commandType, bool upsertQuery);
 static void AcquireExecutorShardLock(Task *task, LOCKMODE lockMode);
-static int32 ExecuteDistributedModify(Task *task);
+static int32 ExecuteDistributedModify(Query *query, Task *task);
 static void ExecuteSingleShardSelect(QueryDesc *queryDesc, uint64 tupleCount,
 									 Task *task, EState *executorState,
 									 TupleDesc tupleDescriptor,
@@ -49,6 +78,17 @@ static void ExecuteSingleShardSelect(QueryDesc *queryDesc, uint64 tupleCount,
 static bool SendQueryInSingleRowMode(PGconn *connection, char *query);
 static bool StoreQueryResult(PGconn *connection, TupleDesc tupleDescriptor,
 							 Tuplestorestate *tupleStore);
+static void ExecuteFunctions(Query *query);
+static Node * PartiallyEvaluateExpression(Node *expression);
+static Node * PartiallyEvaluateExpressionWalker(Node *expression,
+												ExpressionWalkerState *state);
+static void InitializeWalkerState(ExpressionWalkerState *state);
+static List * RewriteArgs(ExpressionWalkerState *state);
+static Node * EvaluateExpression(Node *expression);
+
+static void DeparseShardQuery(Query *query, Task *task, StringInfo queryString);
+static Expr *citus_evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
+						   Oid result_collation);
 
 
 /*
@@ -203,7 +243,9 @@ RouterExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count, Tas
 	if (operation == CMD_INSERT || operation == CMD_UPDATE ||
 		operation == CMD_DELETE)
 	{
-		int32 affectedRowCount = ExecuteDistributedModify(task);
+		MultiPlan *multiPlan = GetMultiPlan(queryDesc->plannedstmt);
+		Query *query = multiPlan->workerJob->jobQuery;
+		int32 affectedRowCount = ExecuteDistributedModify(query, task);
 		estate->es_processed = affectedRowCount;
 	}
 	else if (operation == CMD_SELECT)
@@ -237,12 +279,18 @@ RouterExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count, Tas
  * also generate warnings for individual placement failures.
  */
 static int32
-ExecuteDistributedModify(Task *task)
+ExecuteDistributedModify(Query *query, Task *task)
 {
 	int32 affectedTupleCount = -1;
 	ListCell *taskPlacementCell = NULL;
 	List *failedPlacementList = NIL;
 	ListCell *failedPlacementCell = NULL;
+	StringInfo queryString = makeStringInfo();
+
+	ExecuteFunctions(query);
+	DeparseShardQuery(query, task, queryString);
+	elog(WARNING, "old query: %s", task->queryString);
+	elog(WARNING, "new query: %s", queryString->data);
 
 	foreach(taskPlacementCell, task->taskPlacementList)
 	{
@@ -590,4 +638,317 @@ RouterExecutorEnd(QueryDesc *queryDesc)
 	FreeExecutorState(estate);
 	queryDesc->estate = NULL;
 	queryDesc->totaltime = NULL;
+}
+
+/*
+ * Walks the query looking for and evaluating expressions which don't contain Vars.
+ *
+ * If you have a var your entire part of the tree cannot be evaluated.
+ * So, nothing can be evaluated until we hit a leaf.
+ * However, it would be very wasteful to evaluate at every step. If there are no Vars
+ * we would prefer to only walk the tree once and do a single evaluation at the end.
+ *
+ * When evaluating a tree:
+ * - if this is a node where some children have vars and some don't, evaluate the ones
+ *   without
+ * - if this is a node and there are no Vars, continue going up.
+ * - if this is the top of the tree and there are no Vars evaluate the whole thing
+ * - if this node is a var, signal the parent
+ * - if this node has a var, signal the parent
+ */
+void ExecuteFunctions(Query *query)
+{
+	CmdType commandType = query->commandType;
+	ListCell *targetEntryCell = NULL;
+	Node *modifiedNode = NULL;
+
+	Oid relid = ((RangeTblEntry *) linitial(query->rtable))->relid;
+	List *deparseContext = deparse_context_for("table", relid);
+
+	// TODO: Is DELETE important too?
+	if (!(commandType == CMD_INSERT) && !(commandType == CMD_UPDATE))
+	{
+		return;
+	}
+
+	foreach(targetEntryCell, query->targetList)
+	{
+		char *deparsedOrig = NULL;
+		char *deparsedModified = NULL;
+		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
+		Node *originalCopy = (Node *) copyObject(targetEntry->expr);
+		Node *modifiedCopy = NULL;
+
+		/* performance optimization for the most common cases */
+		if (IsA(targetEntry->expr, Const) || IsA(targetEntry->expr, Var))
+		{
+			continue;
+		}
+
+		deparsedOrig = deparse_expression(originalCopy, deparseContext, false, true);
+		elog(WARNING, "target: %s", deparsedOrig);
+
+		modifiedNode = PartiallyEvaluateExpression((Node *) targetEntry->expr);
+
+		targetEntry->expr = (Expr *) modifiedNode;
+		modifiedCopy = (Node *) copyObject(targetEntry->expr);
+
+		deparsedModified = deparse_expression(modifiedCopy, deparseContext, false, false);
+		elog(WARNING, "after : %s", deparsedModified);
+	}
+}
+
+static Node * PartiallyEvaluateExpression(Node *expression)
+{
+	ExpressionWalkerState unused;
+	InitializeWalkerState(&unused);
+	unused.isTopLevel = true;
+
+	return PartiallyEvaluateExpressionWalker(expression, &unused);
+}
+
+
+static Node * PartiallyEvaluateExpressionWalker(Node *expression,
+		ExpressionWalkerState *state)
+{
+	// TODO: If we don't recognize the node, do the copy and pass through the state?
+	ExpressionWalkerState childState;
+	Node *copy = NULL;
+	bool isVar = false;
+	bool isBranch = false;
+
+	if (expression == NULL)
+	{
+		return expression;
+	}
+
+	if (IsA(expression, List))
+	{
+		return expression_tree_mutator(expression,
+									   PartiallyEvaluateExpressionWalker,
+									   state);
+	}
+
+	InitializeWalkerState(&childState);
+
+	if (IsA(expression, Var))
+	{
+		isVar = true;
+	}
+
+	if (IsA(expression, FuncExpr) || IsA(expression, OpExpr))
+	{
+		/* Tell the next step that it should add itself to one of the subtree lists */
+		childState.parentIsBranch = true;
+		isBranch = true;
+	}
+
+	copy = expression_tree_mutator(expression,
+								   PartiallyEvaluateExpressionWalker,
+								   &childState);
+
+	if (state->parentIsBranch)
+	{
+		if (childState.containsVar || isVar)
+		{
+			state->subtreesWithVar = lappend(state->subtreesWithVar, copy);
+			state->subtreeWeaving = lappend_int(state->subtreeWeaving, 0);
+		}
+		else
+		{
+			state->subtreesWithoutVar = lappend(state->subtreesWithoutVar, copy);
+			state->subtreeWeaving = lappend_int(state->subtreeWeaving, 1);
+		}
+	}
+
+	if (childState.containsVar || isVar)
+	{
+		state->containsVar = true;
+	}
+
+	// why are we checking for state->subtreesWithVar instead of state->containsVar?
+	if (isBranch && state->isTopLevel && list_length(childState.subtreesWithVar) == 0)
+	{
+		return EvaluateExpression(expression);
+	}
+
+	if ((list_length(childState.subtreesWithVar) != 0) &&
+		(list_length(childState.subtreesWithoutVar) != 0))
+	{
+		if (IsA(expression, FuncExpr))
+		{
+			((FuncExpr *) copy)->args = RewriteArgs(&childState);
+		}
+
+		if (IsA(expression, OpExpr))
+		{
+			((OpExpr *) copy)->args = RewriteArgs(&childState);
+		}
+	}
+
+	return copy;
+}
+
+static List * RewriteArgs(ExpressionWalkerState *state)
+{
+	/* Replace every non-subtree arg with the evaluated version of itself */
+	List *rewrittenArgs = NULL;
+	ListCell *nextArgCell = NULL;
+	int nextArg = 0;
+
+	foreach(nextArgCell, state->subtreeWeaving)
+	{
+		nextArg = lfirst_int(nextArgCell);
+		if (nextArg)
+		{
+			Node *original = (Node *)linitial(state->subtreesWithoutVar);
+			Node *evaluated = EvaluateExpression(original);
+			rewrittenArgs = lappend(rewrittenArgs, evaluated);
+			state->subtreesWithoutVar =
+				list_delete_first(state->subtreesWithoutVar);
+		}
+		else
+		{
+			rewrittenArgs = lappend(rewrittenArgs,
+									linitial(state->subtreesWithVar));
+			state->subtreesWithVar = list_delete_first(state->subtreesWithVar);
+		}
+	}
+
+	return rewrittenArgs;
+}
+
+static Node * EvaluateExpression(Node *expression)
+{
+	if(IsA(expression, FuncExpr))
+	{
+		FuncExpr *expr = (FuncExpr *)expression;
+
+		return (Node *) citus_evaluate_expr((Expr *) expr,
+									  expr->funcresulttype,
+									  exprTypmod((Node *) expr),
+									  expr->funccollid);
+	}
+
+	if(IsA(expression, OpExpr))
+	{
+		OpExpr *expr = (OpExpr *)expression;
+
+		return (Node *) citus_evaluate_expr((Expr *) expr,
+									  expr->opresulttype,
+									  exprTypmod((Node *) expr),
+									  expr->opcollid);
+	}
+
+	// TODO: What else should we evaluate here?
+	// What else can contain a function call?
+	return expression;
+}
+
+
+void DeparseShardQuery(Query *query, Task *task, StringInfo queryString)
+{
+	uint64 shardId = task->anchorShardId;
+	Oid relid = ((RangeTblEntry *) linitial(query->rtable))->relid;
+
+	deparse_shard_query(query, relid, shardId, queryString);
+}
+
+void DeparseQuery(Query* query)
+{
+	Oid relid = ((RangeTblEntry *) linitial(query->rtable))->relid;
+	List *deparseContext = deparse_context_for("table", relid);
+	char *deparsed = deparse_expression((Node *)query, deparseContext, false, true);
+	elog(WARNING, "query: %s", deparsed);
+}
+
+static void InitializeWalkerState(ExpressionWalkerState *state)
+{
+	state->isTopLevel = false;
+	state->containsVar = false;
+	state->parentIsBranch = false;
+	state->subtreesWithVar = NULL;
+	state->subtreesWithoutVar = NULL;
+	state->subtreeWeaving = NULL;
+}
+
+/*
+ * citus_evaluate_expr: pre-evaluate a constant expression
+ *
+ * We use the executor's routine ExecEvalExpr() to avoid duplication of
+ * code and ensure we get the same result as the executor would get.
+ */
+Expr *
+citus_evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
+			  Oid result_collation)
+{
+	EState	   *estate;
+	ExprState  *exprstate;
+	MemoryContext oldcontext;
+	Datum		const_val;
+	bool		const_is_null;
+	int16		resultTypLen;
+	bool		resultTypByVal;
+
+	/*
+	 * To use the executor, we need an EState.
+	 */
+	estate = CreateExecutorState();
+
+	/* We can use the estate's working context to avoid memory leaks. */
+	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+
+	/* Make sure any opfuncids are filled in. */
+	fix_opfuncids((Node *) expr);
+
+	/*
+	 * Prepare expr for execution.  (Note: we can't use ExecPrepareExpr
+	 * because it'd result in recursively invoking eval_const_expressions.)
+	 */
+	exprstate = ExecInitExpr(expr, NULL);
+
+	/*
+	 * And evaluate it.
+	 *
+	 * It is OK to use a default econtext because none of the ExecEvalExpr()
+	 * code used in this situation will use econtext.  That might seem
+	 * fortuitous, but it's not so unreasonable --- a constant expression does
+	 * not depend on context, by definition, n'est ce pas?
+	 */
+	const_val = ExecEvalExprSwitchContext(exprstate,
+										  GetPerTupleExprContext(estate),
+										  &const_is_null, NULL);
+
+	/* Get info needed about result datatype */
+	get_typlenbyval(result_type, &resultTypLen, &resultTypByVal);
+
+	/* Get back to outer memory context */
+	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * Must copy result out of sub-context used by expression eval.
+	 *
+	 * Also, if it's varlena, forcibly detoast it.  This protects us against
+	 * storing TOAST pointers into plans that might outlive the referenced
+	 * data.  (makeConst would handle detoasting anyway, but it's worth a few
+	 * extra lines here so that we can do the copy and detoast in one step.)
+	 */
+	if (!const_is_null)
+	{
+		if (resultTypLen == -1)
+			const_val = PointerGetDatum(PG_DETOAST_DATUM_COPY(const_val));
+		else
+			const_val = datumCopy(const_val, resultTypByVal, resultTypLen);
+	}
+
+	/* Release all the junk we just created */
+	FreeExecutorState(estate);
+
+	/*
+	 * Make the constant result node.
+	 */
+	return (Expr *) makeConst(result_type, result_typmod, result_collation,
+							  resultTypLen,
+							  const_val, const_is_null,
+							  resultTypByVal);
 }
