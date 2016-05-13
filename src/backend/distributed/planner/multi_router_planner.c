@@ -284,6 +284,7 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 			    contain_volatile_functions((Node *) targetEntry->expr))
 			{
 				hasNonConstTargetEntryExprs = true;
+				break;
 			}
 
 			if (commandType == CMD_UPDATE &&
@@ -292,13 +293,13 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 				specifiesPartitionValue = true;
 			}
 
-//			if (commandType == CMD_UPDATE &&
-//				ContainsDisallowedFunctionCalls((Node *) targetEntry->expr))
-//			{
-//				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-//								errmsg("functions used in UPDATES cannot be VOLATILE and"
-//									   " must not be called with column references")));
-//			}
+			if (commandType == CMD_UPDATE &&
+				ContainsDisallowedFunctionCalls((Node *) targetEntry->expr))
+			{
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("STABLE functions used in UPDATE queries"
+									   " cannot be called with column references")));
+			}
 		}
 
 		joinTree = queryTree->jointree;
@@ -444,7 +445,7 @@ static bool ContainsDisallowedFunctionCallsWalker(Node *expression, bool *contai
 
 	if (volatileFlag == PROVOLATILE_VOLATILE)
 	{
-		/* the caller should have already checked for this? */
+		/* the caller should have already checked for this */
 		Assert(false);
 	}
 	else if (volatileFlag == PROVOLATILE_STABLE)
