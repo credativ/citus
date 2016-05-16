@@ -115,7 +115,7 @@ SET client_min_messages TO DEFAULT;
 INSERT INTO limit_orders VALUES (random() * 100, 'ORCL', 152, '2011-08-25 11:50:45',
 								 'sell', 0.58);
 
--- commands with expressions that cannot be collapsed are unsupported
+-- values for other columns are totally fine
 INSERT INTO limit_orders VALUES (2036, 'GOOG', 5634, now(), 'buy', random());
 
 -- commands with mutable functions in their quals
@@ -248,7 +248,7 @@ UPDATE limit_orders SET symbol = LOWER(symbol) WHERE id = 246;
 
 SELECT symbol, bidder_id FROM limit_orders WHERE id = 246;
 
--- updates referencing non-IMMUTABLE functions are unsupported
+-- updates referencing STABLE functions are allowed
 UPDATE limit_orders SET placed_at = now() WHERE id = 246;
 
 -- cursors are not supported
