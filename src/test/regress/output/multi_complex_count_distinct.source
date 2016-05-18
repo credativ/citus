@@ -98,6 +98,28 @@ SELECT *
         801 |     7
 (10 rows)
 
+SELECT *
+	FROM (
+		SELECT 
+			l_partkey, count(DISTINCT l_orderkey) 
+			FROM lineitem_hash 
+			GROUP BY l_partkey) sub
+	ORDER BY 2 DESC, 1 DESC
+	LIMIT 10;
+ l_partkey | count 
+-----------+-------
+    199146 |     3
+    188804 |     3
+    177771 |     3
+    160895 |     3
+    149926 |     3
+    136884 |     3
+     87761 |     3
+     15283 |     3
+      6983 |     3
+      1927 |     3
+(10 rows)
+
 -- case expr in count distinct is supported.
 -- count orders partkeys if l_shipmode is air
 SELECT *

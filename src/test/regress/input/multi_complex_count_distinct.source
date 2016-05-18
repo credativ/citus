@@ -62,6 +62,15 @@ SELECT *
 	ORDER BY 2 DESC 
 	LIMIT 10;
 
+SELECT *
+	FROM (
+		SELECT 
+			l_partkey, count(DISTINCT l_orderkey) 
+			FROM lineitem_hash 
+			GROUP BY l_partkey) sub
+	ORDER BY 2 DESC, 1 DESC
+	LIMIT 10;
+
 -- case expr in count distinct is supported.
 -- count orders partkeys if l_shipmode is air
 SELECT *

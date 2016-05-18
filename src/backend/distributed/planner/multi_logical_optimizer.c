@@ -54,12 +54,19 @@ int LimitClauseRowFetchCount = -1; /* number of rows to fetch from each task */
 double CountDistinctErrorRate = 0.0; /* precision of count(distinct) approximate */
 
 
-typedef struct AggregateWalkerContext
+typedef struct MasterAggregateWalkerContext
+{
+	bool repartitionSubquery;
+	AttrNumber columnId;
+} MasterAggregateWalkerContext;
+
+typedef struct WorkerAggregateWalkerContext
 {
 	bool repartitionSubquery;
 	List *expressionList;
-	AttrNumber columnId;
-} AggregateWalkerContext;
+	Index nextSortGroupRefIndex;
+	List *groupByList;
+} WorkerAggregateWalkerContext;
 
 /* Local functions forward declarations */
 static MultiSelect * AndSelectNode(MultiSelect *selectNode);
@@ -102,19 +109,19 @@ static void ApplyExtendedOpNodes(MultiExtendedOp *originalNode,
 								 MultiExtendedOp *masterNode,
 								 MultiExtendedOp *workerNode);
 static void TransformSubqueryNode(MultiTable *subqueryNode);
-static bool CountDistinctAggregateWalker(Node *node, List **groupClauseList);
 static MultiExtendedOp * MasterExtendedOpNode(MultiExtendedOp *originalOpNode);
 static Node * MasterAggregateMutator(Node *originalNode,
-									 AggregateWalkerContext *walkerContext);
+									 MasterAggregateWalkerContext *walkerContext);
 static Expr * MasterAggregateExpression(Aggref *originalAggregate,
-										AggregateWalkerContext *walkerContext);
+										MasterAggregateWalkerContext *walkerContext);
 static Expr * MasterAverageExpression(Oid sumAggregateType, Oid countAggregateType,
 									  AttrNumber *columnId);
 static Expr * AddTypeConversion(Node *originalAggregate, Node *newExpression);
 static MultiExtendedOp * WorkerExtendedOpNode(MultiExtendedOp *originalOpNode);
-static bool WorkerAggregateWalker(Node *node, AggregateWalkerContext *walkerContext);
-static List * WorkerAggregateExpressionList(Aggref *originalAggregate, bool
-											repartitionSubquery);
+static bool WorkerAggregateWalker(Node *node,
+								  WorkerAggregateWalkerContext *walkerContext);
+static List * WorkerAggregateExpressionList(Aggref *originalAggregate,
+											WorkerAggregateWalkerContext *walkerContextry);
 static AggregateType GetAggregateType(Oid aggFunctionId);
 static Oid AggregateArgumentType(Aggref *aggregate);
 static Oid AggregateFunctionOid(const char *functionName, Oid inputType);
@@ -1154,18 +1161,12 @@ TransformSubqueryNode(MultiTable *subqueryNode)
 	MultiNode *collectNode = ChildNode((MultiUnaryNode *) extendedOpNode);
 	MultiNode *collectChildNode = ChildNode((MultiUnaryNode *) collectNode);
 	MultiExtendedOp *masterExtendedOpNode = MasterExtendedOpNode(extendedOpNode);
+	MultiExtendedOp *workerExtendedOpNode = WorkerExtendedOpNode(extendedOpNode);
 	MultiPartition *partitionNode = CitusMakeNode(MultiPartition);
-	MultiExtendedOp *workerExtendedOpNode = NULL;
 	List *groupTargetEntryList = NIL;
 	TargetEntry *groupByTargetEntry = NULL;
 	Expr *groupByExpression = NULL;
-
-	List *targetEntryList = extendedOpNode->targetList;
 	List *groupClauseList = extendedOpNode->groupClauseList;
-
-	CountDistinctAggregateWalker((Node *) targetEntryList, &groupClauseList);
-
-	workerExtendedOpNode = WorkerExtendedOpNode(extendedOpNode);
 
 	groupTargetEntryList = GroupTargetEntryList(groupClauseList,
 												workerExtendedOpNode->targetList);
@@ -1215,102 +1216,6 @@ TransformSubqueryNode(MultiTable *subqueryNode)
 
 
 /*
- * CountDistinctAggregateWalker walks through count distinct aggregates
- * and adds referenced columns to group clause list. It finds the max
- * tleSortGroupRef and uses that value when deciding the next sort group ref value.
- */
-static bool
-CountDistinctAggregateWalker(Node *node, List **groupClauseList)
-{
-	int sortGroupRefIndex = 1;
-	bool walkerResult = false;
-	ListCell *groupCell = NULL;
-
-	if (node == NULL)
-	{
-		return false;
-	}
-
-	/* assign starting sortGroupRefIndex to max + 1 of existing tleSortGroupRef */
-	foreach(groupCell, *groupClauseList)
-	{
-		SortGroupClause *groupClause = (SortGroupClause *) lfirst(groupCell);
-
-		if (groupClause->tleSortGroupRef > sortGroupRefIndex)
-		{
-			sortGroupRefIndex = groupClause->tleSortGroupRef;
-		}
-	}
-
-	sortGroupRefIndex++;
-
-
-	if (IsA(node, Aggref))
-	{
-		Aggref *aggregate = (Aggref *) node;
-		AggregateType aggregateType = GetAggregateType(aggregate->aggfnoid);
-
-		if (aggregateType == AGGREGATE_COUNT && aggregate->aggdistinct)
-		{
-			List *aggTargetEntryList = aggregate->args;
-			TargetEntry *distinctTargetEntry = linitial(aggTargetEntryList);
-			List *columnList = pull_var_clause_default((Node *) distinctTargetEntry);
-			ListCell *columnCell = NULL;
-			List *addedColumnList = NIL;
-
-			distinctTargetEntry->ressortgroupref = sortGroupRefIndex;
-
-			foreach(columnCell, columnList)
-			{
-				Var *columnVar = (Var *) lfirst(columnCell);
-				Oid opLt = InvalidOid;
-				Oid opEq = InvalidOid;
-				Oid opGt = InvalidOid;
-				bool hashable = false;
-				SortGroupClause *newDistinctGroupBy = NULL;
-
-				if (list_member(addedColumnList, columnVar))
-				{
-					continue;
-				}
-
-				addedColumnList = lappend(addedColumnList, columnVar);
-
-				newDistinctGroupBy = makeNode(SortGroupClause);
-
-				get_sort_group_operators(columnVar->vartype, true, true, true, &opLt,
-										 &opEq, &opGt, &hashable);
-
-				newDistinctGroupBy->eqop = opEq;
-				newDistinctGroupBy->hashable = hashable;
-				newDistinctGroupBy->nulls_first = false;
-				newDistinctGroupBy->sortop = opLt;
-				newDistinctGroupBy->tleSortGroupRef = sortGroupRefIndex;
-
-				(*groupClauseList) = lappend(*groupClauseList, newDistinctGroupBy);
-				sortGroupRefIndex++;
-			}
-
-			walkerResult = expression_tree_walker(node, CountDistinctAggregateWalker,
-												  (void *) groupClauseList);
-		}
-		else
-		{
-			walkerResult = expression_tree_walker(node, CountDistinctAggregateWalker,
-												  (void *) groupClauseList);
-		}
-	}
-	else
-	{
-		walkerResult = expression_tree_walker(node, CountDistinctAggregateWalker,
-											  (void *) groupClauseList);
-	}
-
-	return walkerResult;
-}
-
-
-/*
  * MasterExtendedOpNode creates the master extended operator node from the given
  * target entries. The function walks over these target entries; and for entries
  * with aggregates in them, this function calls the aggregate expression mutator
@@ -1330,11 +1235,11 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
 	ListCell *targetEntryCell = NULL;
 	MultiNode *parentNode = ParentNode((MultiNode *) originalOpNode);
 	MultiNode *childNode = ChildNode((MultiUnaryNode *) originalOpNode);
-	AggregateWalkerContext *walkerContext = palloc0(sizeof(AggregateWalkerContext));
+	MasterAggregateWalkerContext *walkerContext = palloc0(
+		sizeof(MasterAggregateWalkerContext));
 
 	walkerContext->columnId = 1;
 	walkerContext->repartitionSubquery = false;
-	walkerContext->expressionList = NIL;
 
 	if (CitusIsA(parentNode, MultiTable) && CitusIsA(childNode, MultiCollect))
 	{
@@ -1398,7 +1303,7 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode)
  * depth first order.
  */
 static Node *
-MasterAggregateMutator(Node *originalNode, AggregateWalkerContext *walkerContext)
+MasterAggregateMutator(Node *originalNode, MasterAggregateWalkerContext *walkerContext)
 {
 	Node *newNode = NULL;
 	if (originalNode == NULL)
@@ -1445,7 +1350,7 @@ MasterAggregateMutator(Node *originalNode, AggregateWalkerContext *walkerContext
  */
 static Expr *
 MasterAggregateExpression(Aggref *originalAggregate,
-						  AggregateWalkerContext *walkerContext)
+						  MasterAggregateWalkerContext *walkerContext)
 {
 	AggregateType aggregateType = GetAggregateType(originalAggregate->aggfnoid);
 	Expr *newMasterExpression = NULL;
@@ -1789,7 +1694,10 @@ AddTypeConversion(Node *originalAggregate, Node *newExpression)
  * with aggregates in them, this function calls the recursive aggregate walker
  * function to create aggregates for the worker nodes. Also, the function checks
  * if we can push down the limit to worker nodes; and if we can, sets the limit
- * count and sort clause list fields in the new operator node.
+ * count and sort clause list fields in the new operator node. It provides special
+ * treatment for count distinct operator if it is used in repartition subqueries.
+ * Each column in count distinct aggregate is added to target list, and group by
+ * list of worker extended operator.
  */
 static MultiExtendedOp *
 WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
@@ -1798,13 +1706,30 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 	MultiNode *parentNode = ParentNode((MultiNode *) originalOpNode);
 	MultiNode *childNode = ChildNode((MultiUnaryNode *) originalOpNode);
 	List *targetEntryList = originalOpNode->targetList;
-	List *newTargetEntryList = NIL;
 	ListCell *targetEntryCell = NULL;
+	List *newTargetEntryList = NIL;
+	List *originalGroupClauseList = copyObject(originalOpNode->groupClauseList);
+	List *groupClauseList = NIL;
 	AttrNumber targetProjectionNumber = 1;
-	AggregateWalkerContext *walkerContext = palloc0(sizeof(AggregateWalkerContext));
-	walkerContext->columnId = -1;
+	Index maxSortGroupRefIndex = 0;
+	WorkerAggregateWalkerContext *walkerContext =
+		palloc0(sizeof(WorkerAggregateWalkerContext));
 	walkerContext->repartitionSubquery = false;
 	walkerContext->expressionList = NIL;
+	walkerContext->nextSortGroupRefIndex = 0;
+	walkerContext->groupByList = NIL;
+
+	/* find max of sort group ref index */
+	foreach(targetEntryCell, targetEntryList)
+	{
+		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
+		if (targetEntry->ressortgroupref > maxSortGroupRefIndex)
+		{
+			maxSortGroupRefIndex = targetEntry->ressortgroupref;
+		}
+	}
+
+	walkerContext->nextSortGroupRefIndex = maxSortGroupRefIndex + 1;
 
 	if (CitusIsA(parentNode, MultiTable) && CitusIsA(childNode, MultiCollect))
 	{
@@ -1817,19 +1742,29 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 		TargetEntry *originalTargetEntry = (TargetEntry *) lfirst(targetEntryCell);
 		Expr *originalExpression = originalTargetEntry->expr;
 		List *newExpressionList = NIL;
+		List *newGroupClauseList = NIL;
 		ListCell *newExpressionCell = NULL;
 		int targetIndex = 1;
-		walkerContext->expressionList = NIL;
-
 		bool hasAggregates = contain_agg_clause((Node *) originalExpression);
+
+		walkerContext->expressionList = NIL;
+		walkerContext->groupByList = NIL;
+
 		if (hasAggregates)
 		{
 			WorkerAggregateWalker((Node *) originalExpression, walkerContext);
 			newExpressionList = walkerContext->expressionList;
+			newGroupClauseList = walkerContext->groupByList;
 		}
 		else
 		{
 			newExpressionList = list_make1(originalExpression);
+		}
+
+		/* add newly found group by clauses to list */
+		if (newGroupClauseList != NIL)
+		{
+			groupClauseList = list_concat(groupClauseList, newGroupClauseList);
 		}
 
 		/* now create target entries for each new expression */
@@ -1877,9 +1812,14 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
 		}
 	}
 
+	if (groupClauseList != NIL)
+	{
+		originalGroupClauseList = list_concat(originalGroupClauseList, groupClauseList);
+	}
+
 	workerExtendedOpNode = CitusMakeNode(MultiExtendedOp);
 	workerExtendedOpNode->targetList = newTargetEntryList;
-	workerExtendedOpNode->groupClauseList = originalOpNode->groupClauseList;
+	workerExtendedOpNode->groupClauseList = originalGroupClauseList;
 
 	/* if we can push down the limit, also set related fields */
 	workerExtendedOpNode->limitCount = WorkerLimitCount(originalOpNode);
@@ -1897,7 +1837,7 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode)
  * types.
  */
 static bool
-WorkerAggregateWalker(Node *node, AggregateWalkerContext *walkerContext)
+WorkerAggregateWalker(Node *node, WorkerAggregateWalkerContext *walkerContext)
 {
 	bool walkerResult = false;
 	if (node == NULL)
@@ -1909,8 +1849,7 @@ WorkerAggregateWalker(Node *node, AggregateWalkerContext *walkerContext)
 	{
 		Aggref *originalAggregate = (Aggref *) node;
 		List *workerAggregateList = WorkerAggregateExpressionList(originalAggregate,
-																  walkerContext->
-																  repartitionSubquery);
+																  walkerContext);
 
 		walkerContext->expressionList = list_concat(walkerContext->expressionList,
 													workerAggregateList);
@@ -1934,33 +1873,42 @@ WorkerAggregateWalker(Node *node, AggregateWalkerContext *walkerContext)
 /*
  * WorkerAggregateExpressionList takes in the original aggregate function, and
  * determines the transformed aggregate functions to execute on worker nodes.
- * The function then returns these aggregates in a list.
+ * The function then returns these aggregates in a list. It also creates
+ * group by clauses for newly added targets to be placed in the extended operator
+ * node.
  */
 static List *
-WorkerAggregateExpressionList(Aggref *originalAggregate, bool repartitionSubquery)
+WorkerAggregateExpressionList(Aggref *originalAggregate,
+							  WorkerAggregateWalkerContext *walkerContext)
 {
 	AggregateType aggregateType = GetAggregateType(originalAggregate->aggfnoid);
 	List *workerAggregateList = NIL;
 
 	if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
-		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION && repartitionSubquery)
+		CountDistinctErrorRate == DISABLE_DISTINCT_APPROXIMATION &&
+		walkerContext->repartitionSubquery)
 	{
 		Aggref *aggregate = (Aggref *) copyObject(originalAggregate);
 		List *aggTargetEntryList = aggregate->args;
 		TargetEntry *distinctTargetEntry = (TargetEntry *) linitial(aggTargetEntryList);
 		List *columnList = pull_var_clause_default((Node *) distinctTargetEntry);
 		ListCell *columnCell = NULL;
-		Index sortGroupRef = distinctTargetEntry->ressortgroupref;
 		List *groupRefList = NIL;
 
 		foreach(columnCell, columnList)
 		{
 			TargetEntry *newTargetEntry = makeNode(TargetEntry);
 			Var *column = (Var *) lfirst(columnCell);
+			SortGroupClause *newDistinctGroupBy = NULL;
+			Oid opLt = InvalidOid;
+			Oid opEq = InvalidOid;
+			Oid opGt = InvalidOid;
+			bool hashable = false;
+
 			newTargetEntry->expr = copyObject(column);
 			newTargetEntry->resno = 0;
 			newTargetEntry->resname = NULL;
-			newTargetEntry->ressortgroupref = sortGroupRef;
+			newTargetEntry->ressortgroupref = walkerContext->nextSortGroupRefIndex;
 
 			if (list_member(groupRefList, column))
 			{
@@ -1969,7 +1917,22 @@ WorkerAggregateExpressionList(Aggref *originalAggregate, bool repartitionSubquer
 			groupRefList = lappend(groupRefList, column);
 
 			workerAggregateList = lappend(workerAggregateList, newTargetEntry);
-			sortGroupRef++;
+
+			/* create a group by clause for the new target entry and add to the list*/
+			newDistinctGroupBy = makeNode(SortGroupClause);
+			get_sort_group_operators(column->vartype, true, true, true, &opLt, &opEq,
+									 &opGt, &hashable);
+			newDistinctGroupBy->eqop = opEq;
+			newDistinctGroupBy->hashable = hashable;
+			newDistinctGroupBy->nulls_first = false;
+			newDistinctGroupBy->sortop = opLt;
+			newDistinctGroupBy->tleSortGroupRef = newTargetEntry->ressortgroupref;
+
+			walkerContext->groupByList = lappend(walkerContext->groupByList,
+												 newDistinctGroupBy);
+
+			/* increment group ref index for next target */
+			walkerContext->nextSortGroupRefIndex++;
 		}
 	}
 	else if (aggregateType == AGGREGATE_COUNT && originalAggregate->aggdistinct &&
